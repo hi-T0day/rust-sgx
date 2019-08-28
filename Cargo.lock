@@ -73,6 +73,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-queues"
+version = "0.1.0"
+dependencies = [
+ "fortanix-sgx-abi 0.3.3",
+]
+
+[[package]]
 name = "atty"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -416,6 +423,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 name = "enclave-runner"
 version = "0.2.0"
 dependencies = [
+ "async-queues 0.1.0",
  "crossbeam 0.7.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "failure 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "failure_derive 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",

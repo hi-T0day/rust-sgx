@@ -32,6 +32,7 @@ use futures::future::{Either, FutureExt, TryFutureExt, Future};
 use tokio::prelude::{Async, AsyncRead, AsyncWrite, Poll};
 use tokio::sync::lock::Lock;
 use tokio::sync::mpsc as async_mpsc;
+use async_queues::FifoDescriptorContainer;
 
 use fortanix_sgx_abi::*;
 use sgxs::loader::Tcs as SgxsTcs;
@@ -544,6 +545,8 @@ pub(crate) struct EnclaveState {
     exiting: AtomicBool,
     usercall_ext: Box<dyn UsercallExtension>,
     threads_queue: crossbeam::queue::SegQueue<StoppedTcs>,
+    create_fifo_descriptors: std::sync::Once,
+
 }
 
 struct Work {
@@ -624,6 +627,7 @@ impl EnclaveState {
         for thread in threads_vector {
             threads_queue.push(Self::event_queue_add_tcs(&mut event_queues, thread));
         }
+        let create_fifo_descriptors = std::sync::Once::new();
 
         Arc::new(EnclaveState {
             kind,
@@ -633,6 +637,8 @@ impl EnclaveState {
             exiting: AtomicBool::new(false),
             usercall_ext,
             threads_queue,
+            create_fifo_descriptors,
+
         })
     }
 
@@ -1415,6 +1421,23 @@ impl<'tcs> IOHandlerInput<'tcs> {
         usercall_queue: &mut FifoDescriptor<Usercall>,
         return_queue: &mut FifoDescriptor<Return>,
     ) -> IoResult<()> {
-        Err(IoErrorKind::Other.into())
+        if self.enclave.create_fifo_descriptors.is_completed() {
+            // !!! calling the function a second time.
+            // Should be "equivalent to calling exit(true)"
+//            self.enclave.abort_all_threads();
+//            return EnclaveAbort::Exit { true }
+            return Err(IoErrorKind::Other.into());
+        }
+
+        let mut uq: Option<FifoDescriptorContainer<Usercall>> = None;
+        let mut rq: Option<FifoDescriptorContainer<Return>> = None;
+        self.enclave.create_fifo_descriptors.call_once( || {
+            uq = Some(FifoDescriptorContainer::new(8));
+            rq = Some(FifoDescriptorContainer::new(8));
+        });
+        *usercall_queue = uq.unwrap().inner;
+        *return_queue = rq.unwrap().inner;
+
+        Ok(())
     }
 }

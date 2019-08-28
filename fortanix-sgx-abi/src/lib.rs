@@ -83,6 +83,7 @@
 
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicUsize;
+use core::cell::UnsafeCell;
 
 macro_rules! invoke_with_abi_spec [
     ( $m:ident ) => [ $m![
@@ -702,10 +703,10 @@ pub mod async {
     pub struct FifoDescriptor<T> {
         /// Pointer to the queue memory. Must have a size of
         /// `len * size_of::<T>()` bytes and have alignment `align_of::<T>`.
-        pub data: *mut T,
+        pub data: *const Slot<T>,
         /// The number of elements pointed to by `data`. Must be a power of two
         /// less than or equal to 2³¹.
-        pub len: usize,
+        pub capacity: u32,
         /// Actually a `(u32, u32)` tuple, aligned to allow atomic operations
         /// on both halves simultaneously. The first element (low dword) is
         /// the read offset and the second element (high dword) is the write
@@ -724,6 +725,13 @@ pub mod async {
     // not using `#[derive]` because that would require T: Copy
     #[cfg_attr(feature = "rustc-dep-of-std", unstable(feature = "sgx_platform", issue = "56975"))]
     impl<T> Copy for FifoDescriptor<T> {}
+
+    #[repr(C)]
+    pub struct Slot<T> {
+        /// `0` indicates this slot is empty.
+        pub id: AtomicUsize,
+        pub data: UnsafeCell<T>,
+    }
 
     /// # Asynchronous usercalls
     ///
