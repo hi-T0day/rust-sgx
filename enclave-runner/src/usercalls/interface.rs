@@ -15,6 +15,7 @@ use super::abi::{UsercallResult, Usercalls};
 use super::{EnclaveAbort, IOHandlerInput};
 use crate::futures::FutureExt;
 use futures::future::Future;
+use tokio::prelude::task::AtomicTask;
 
 pub(super) struct Handler<'ioinput, 'tcs>(pub &'ioinput mut IOHandlerInput<'tcs>);
 

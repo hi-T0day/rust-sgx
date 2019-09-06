@@ -637,8 +637,8 @@ pub mod async {
     #[derive(Copy, Clone)]
     #[cfg_attr(feature = "rustc-dep-of-std", unstable(feature = "sgx_platform", issue = "56975"))]
     pub struct Usercall {
-        /// `0` indicates this slot is empty.
-        pub id: u64,
+//        /// `0` indicates this slot is empty.
+//        pub id: u64,
         /// The elements correspond to the RDI, RSI, RDX, R8, and R9 registers
         /// in the synchronous calling convention.
         pub args: (u64, u64, u64, u64, u64)
@@ -649,8 +649,8 @@ pub mod async {
     #[derive(Copy, Clone)]
     #[cfg_attr(feature = "rustc-dep-of-std", unstable(feature = "sgx_platform", issue = "56975"))]
     pub struct Return {
-        /// `0` indicates this slot is empty.
-        pub id: u64,
+//        /// `0` indicates this slot is empty.
+//        pub id: u64,
         /// The elements correspond to the RSI and RDX registers in the
         /// synchronous calling convention.
         pub value: (u64, u64)

@@ -6,69 +6,69 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use fortanix_sgx_abi::{FifoDescriptor, Slot};
 
-//#[derive(Clone)]
-//pub struct Sender<T>(Arc<Queue<T>>);
-//
-//unsafe impl<T> Send for Sender<T> {}
-//
-//impl<T: Copy + Sync> Sender<T> {
-//    pub fn send(&self, id: usize, data: T) -> Option<bool /* wakeup reciever? */> {
-//        unsafe { (self.0).0.send(id, data) }
-//    }
-//
-//    pub fn into_raw(self) -> FifoDescriptor<T> {
-//        self.0.into_raw()
-//    }
-//}
-//
-//unsafe impl<T> Send for Reciever<T> {}
-//
-//pub struct Reciever<T>(Arc<Queue<T>>);
-//
-//impl<T: Copy> Reciever<T> {
-//    pub fn recv(&mut self) -> Option<(usize, T, bool /* wakeup sender? */)> {
-//        unsafe { (self.0).0.recv() }
-//    }
-//
-//    pub fn is_empty(&self) -> bool {
-//        unsafe { (self.0).0.len() == 0 }
-//    }
-//
-//    pub fn into_raw(self) -> FifoDescriptor<T> {
-//        self.0.into_raw()
-//    }
-//}
-//
-//struct Queue<T>(FifoDescriptorContainer<T>);
-//
-//impl<T> Queue<T> {
-//    pub fn new(capacity: usize) -> Self {
-//        let offsets: Box<AtomicUsize> = Box::new(AtomicUsize::new(0));
-//        let data: Box<[Slot<T>]> = iter::repeat_with(|| unsafe { mem::zeroed() }).take(capacity).collect::<Vec<_>>()
-//            .into_boxed_slice();
-//        assert_eq!(data.len(), capacity);
-//        let data = Box::into_raw(data) as *mut Slot<T>;
-//        let descriptor = FifoDescriptor { data, capacity: capacity as u32, offsets: Box::into_raw(offsets) };
-////        let descriptor = FifoDescriptorContainer::from_raw(data, capacity as u32, Box::into_raw(offsets));
-//        Queue(descriptor)
-//    }
-//
-//    fn into_raw(&self) -> FifoDescriptor<T> {
-//        unsafe { ptr::read(&self.0) }
-//    }
-//}
-//
-//impl<T> Drop for Queue<T> {
-//    fn drop(&mut self) {
-//        unsafe { Box::from_raw(self.0.offsets as *mut AtomicUsize) };
-//        unsafe { Box::from_raw(slice::from_raw_parts_mut(self.0.data as *mut Slot<T>, self.0.capacity as usize)) };
-//    }
-//}
-//
-//pub fn channel<T>(capacity: usize) -> (Sender<T>, Reciever<T>) {
-//    let queue = Arc::new(Queue::new(capacity));
-//    (Sender(queue.clone()), Reciever(queue))
-//}
+#[derive(Clone)]
+pub struct Sender<T>(Arc<Queue<T>>);
+
+unsafe impl<T> Send for Sender<T> {}
+
+impl<T: Copy + Sync> Sender<T> {
+    pub fn send(&self, id: usize, data: T) -> Option<bool /* wakeup reciever? */> {
+        unsafe { (self.0).0.send(id, data) }
+    }
+
+    pub fn into_raw(self) -> FifoDescriptor<T> {
+        self.0.into_raw()
+    }
+}
+
+unsafe impl<T> Send for Reciever<T> {}
+
+pub struct Reciever<T>(Arc<Queue<T>>);
+
+impl<T: Copy> Reciever<T> {
+    pub fn recv(&mut self) -> Option<(usize, T, bool /* wakeup sender? */)> {
+        unsafe { (self.0).0.recv() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        unsafe { (self.0).0.len() == 0 }
+    }
+
+    pub fn into_raw(self) -> FifoDescriptor<T> {
+        self.0.into_raw()
+    }
+}
+
+struct Queue<T>(FifoDescriptorContainer<T>);
+
+impl<T> Queue<T> {
+    pub fn new(capacity: usize) -> Self {
+        let offsets: Box<AtomicUsize> = Box::new(AtomicUsize::new(0));
+        let data: Box<[Slot<T>]> = iter::repeat_with(|| unsafe { mem::zeroed() }).take(capacity).collect::<Vec<_>>()
+            .into_boxed_slice();
+        assert_eq!(data.len(), capacity);
+        let data = Box::into_raw(data) as *mut Slot<T>;
+        let descriptor = FifoDescriptor { data, capacity: capacity as u32, offsets: Box::into_raw(offsets) };
+
+        Queue(FifoDescriptorContainer{inner: descriptor})
+    }
+
+    fn into_raw(&self) -> FifoDescriptor<T> {
+        unsafe { ptr::read(&self.0.inner) }
+    }
+}
+
+impl<T> Drop for Queue<T> {
+    fn drop(&mut self) {
+        unsafe { Box::from_raw(self.0.inner.offsets as *mut AtomicUsize) };
+        unsafe { Box::from_raw(slice::from_raw_parts_mut(self.0.inner.data as *mut Slot<T>, self.0.inner.capacity as usize)) };
+    }
+}
+
+pub fn channel<T>(capacity: usize) -> (Sender<T>, Reciever<T>) {
+    let queue = Arc::new(Queue::new(capacity));
+    (Sender(queue.clone()), Reciever(queue))
+}
 
 /*
 /// A circular buffer used as a FIFO queue with atomic reads and writes.
@@ -115,6 +115,9 @@ pub struct Slot<T> {
 pub struct FifoDescriptorContainer<T> {
     pub inner: FifoDescriptor<T>,
 }
+
+unsafe impl <T:Copy> Sync for FifoDescriptorContainer<T> {}
+unsafe impl <T:Copy> Send for FifoDescriptorContainer<T> {}
 
 #[derive(Debug)]
 struct Offsets {
