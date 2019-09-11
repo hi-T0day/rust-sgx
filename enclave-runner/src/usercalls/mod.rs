@@ -874,63 +874,89 @@ impl EnclaveState {
             async_ret_rx: crossbeam::crossbeam_channel::Receiver<(Return, usize)>
         ) -> Vec<JoinHandle<()>> {
             let mut thread_handles = vec![];
+            let writer_waker = Arc::new(tokio::prelude::task::AtomicTask::new());
+            let reader_waker = Arc::new(tokio::prelude::task::AtomicTask::new());
 
             //loop through async_queue
-            let mut enclave_clone = enclave.clone();
+            let enclave_clone = enclave.clone();
             let mut io_queue_send_clone = io_queue_send.clone();
-            thread_handles.push(
-                thread::spawn(move || {
+            let reader_waker_clone = reader_waker.clone();
+            let writer_waker_clone = writer_waker.clone();
+            thread::spawn(move || {
+
+                tokio::runtime::current_thread::block_on_all(tokio::prelude::future::poll_fn(|| -> Poll<(),()> {
                     loop {
                         let val = unsafe {enclave_clone.async_queue_usercall.recv()};
-                        match val{
+                        match val {
                             None => {
-                                // TODO: sleep
-                                // TODO: retry after waking up
+                                // sleep
+                                // retry after waking up
+                                reader_waker_clone.register();
+                                return Ok(Async::NotReady);
                             },
                             Some((id, usercall, wakeup_writer)) => {
                                 let buf = RefCell::new([0u8; 1024]);
                                 let ret = io_queue_send_clone.try_send((UsercallType::Async(usercall, id), buf));
                                 if ret.is_err() {
-                                    // TODO: confirm if this is correct
+                                    // confirm if this is correct
                                     break;
                                 }
                                 if wakeup_writer {
-                                    // TODO: notify writer
+                                    // notify writer
+                                    writer_waker_clone.notify();
                                 }
                             }
                         }
                     }
-                })
-            );
+                    return Ok(Async::Ready(()));
+                }));
+            });
 
-            let mut enclave_clone = enclave.clone();
-            thread_handles.push(
-                thread::spawn(move || {
-                    loop {
-                        match async_ret_rx.recv() {
-                            Err(_) => {
-                                // TODO: check if this is correct
-                                break;
-                            }
-                            Ok((ret, id)) => {
-                                let wakeup_reader = unsafe { enclave_clone.async_queue_return.send(id, ret) };
-                                match wakeup_reader {
-                                    None => {
-                                        // TODO: sleep
-                                        // TODO: retry after waking up
-                                    }
-                                    Some(true) => {
-                                        // TODO: notify reader
-                                    }
-                                    Some(false) => {
-                                        // do nothing
+            let enclave_clone = enclave.clone();
+            thread::spawn(move || {
+                // save data here if unsent;
+                let mut unsent_data : Option<(Return, usize)> = None;
+                tokio::runtime::current_thread::block_on_all(
+                    tokio::prelude::future::poll_fn( || -> Poll<(),()> {
+                        loop {
+                            let val = match unsent_data {
+                                None => async_ret_rx.recv(),
+                                Some(v) =>  {
+                                    unsent_data = None;
+                                    Ok(v)
+                                }
+                            };
+                            match val {
+                                Err(_) => {
+                                    // check if this is correct
+                                    break;
+                                }
+                                Ok((ret, id)) => {
+                                    let wakeup_reader = unsafe { enclave_clone.async_queue_return.send(id, ret) };
+                                    match wakeup_reader {
+                                        None => {
+                                            // sleep
+                                            // retry after waking up
+                                            unsent_data = Some((ret,id));
+                                            writer_waker.register();
+                                            return Ok(Async::NotReady);
+                                        }
+                                        Some(true) => {
+                                            // notify reader
+                                            reader_waker.notify();
+                                        }
+                                        Some(false) => {
+                                            // do nothing
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                })
-            );
+                        return Ok(Async::Ready(()));
+                    })
+                );
+            });
+
             for _ in 0..num_of_worker_threads {
                 let work_receiver = work_receiver.clone();
                 let mut io_queue_send = io_queue_send.clone();
