@@ -83,6 +83,50 @@ pub(crate) fn coenter<T: Tcs>(
     let mut _tmp1: u64;
     let mut _tmp2: u64;
 
+// using a macro for conditional compilation because inline assembly requires
+// a string literal, a string constant doesn't work
+#[cfg(target_os = "linux")]
+macro_rules! enclu_with_aep(() => ("
+.weak __vdso_sgx_enter_enclave
+.type __vdso_sgx_enter_enclave, function
+        mov __vdso_sgx_enter_enclave@GOTPCREL(%rip), %r11    // Check if __vdso_sgx_enter_enclave
+        test %r11, %r11                                      // exists. We're using weak linkage,
+                                                             // so it might not.
+
+        jnz 2f                                               // Jump & use VDSO if available,
+                                                             // otherwise, just call ENCLU directly.
+
+        lea 1f(%rip), %rcx                                   // set SGX AEP
+1:      enclu
+        jmp 3f
+
+        // Strongly link to another symbol in the VDSO, so that the linker will
+        // include a DT_NEEDED entry for `linux-vdso.so.1`. This doesn't happen
+        // automatically because rustc passes `--as-needed` to the linker. This
+        // is never executed because of the unconditional jump above.
+.global __vdso_clock_gettime
+        call __vdso_clock_gettime@PLT
+
+2:      pushq $$0                                            // push argument: handler = NULL
+        pushq $$0                                            // push argument: e = NULL
+        push %rbx                                            // push argument: tcs
+        call __vdso_sgx_enter_enclave@PLT
+        add $$0x18, %rsp                                     // pop function arguments
+
+        test %rax, %rax                                      // Check if there was an error, and if
+        jnz 3f                                               // there wasn't, set RAX (return value)
+        mov $$4, %rax                                        // to 4 (EEXIT), just like ENCLU.
+3:
+")
+);
+
+#[cfg(not(target_os = "linux"))]
+macro_rules! enclu_with_aep(() => ("
+        lea 1f(%rip), %rcx                                   // set SGX AEP
+1:      enclu
+")
+);
+
     unsafe {
         let mut uninit_debug_buf: std::mem::MaybeUninit<DebugBuffer>;
         let debug_buf = debug_buf.map(|r| r.borrow_mut());
@@ -93,11 +137,8 @@ pub(crate) fn coenter<T: Tcs>(
                 uninit_debug_buf.as_mut_ptr() as *mut _
             }
         };
-        asm!("
-        lea 1f(%rip),%rcx
-1:
-        enclu
-"       : "={eax}"(sgx_result), "={rbx}"(_tmp1), "={r10}"(_tmp2),
+        asm!(enclu_with_aep!()
+            : "={eax}"(sgx_result), "={rbx}"(_tmp1), "={r10}"(_tmp2),
               "={rdi}"(p1), "={rsi}"(p2), "={rdx}"(p3), "={r8}"(p4), "={r9}"(p5)
             : "{eax}" (2), "{rbx}"(tcs.address()), "{r10}"(debug_buf),
               "{rdi}"(p1), "{rsi}"(p2), "{rdx}"(p3), "{r8}"(p4), "{r9}"(p5)
