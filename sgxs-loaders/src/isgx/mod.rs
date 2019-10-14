@@ -15,13 +15,17 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
 
-use abi::{Attributes, Einittoken, ErrorCode, Miscselect, Secinfo, Secs, Sigstruct};
+use nix::sys::mman::{mmap, munmap, mprotect, ProtFlags as Prot, MapFlags as Map};
+
+use abi::{Attributes, Einittoken, ErrorCode, Miscselect, Secinfo, Secs, Sigstruct, PageType, SecinfoFlags};
 use sgxs_crate::einittoken::EinittokenProvider;
 use sgxs_crate::loader;
 use sgxs_crate::sgxs::{MeasEAdd, MeasECreate, PageChunks, SgxsRead};
 
 use crate::{MappingInfo, Tcs};
 use generic::{self, EinittokenError, EnclaveLoad, Mapping};
+
+use self::DriverVersion::*;
 
 #[derive(Fail, Debug)]
 pub enum SgxIoctlError {
@@ -45,6 +49,12 @@ pub enum Error {
     Add(#[cause] SgxIoctlError),
     #[fail(display = "Failed to call EINIT.")]
     Init(#[cause] SgxIoctlError),
+}
+
+impl Error {
+    fn map(error: nix::Error) -> Self {
+        Error::Map(error.as_errno().unwrap().into())
+    }
 }
 
 impl EinittokenError for Error {
@@ -82,24 +92,59 @@ impl EnclaveLoad for InnerDevice {
     type Error = Error;
 
     fn new(
-        device: Arc<InnerDevice>,
+        mut device: Arc<InnerDevice>,
         ecreate: MeasECreate,
         attributes: Attributes,
         miscselect: Miscselect,
     ) -> Result<Mapping<Self>, Self::Error> {
+        let esize = ecreate.size as usize;
         let ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                ecreate.size as usize,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_SHARED,
-                device.fd.as_raw_fd(),
-                0,
-            )
+            match device.driver {
+                External => {
+                    mmap(
+                        ptr::null_mut(),
+                        esize,
+                        Prot::PROT_READ | Prot::PROT_WRITE | Prot::PROT_EXEC,
+                        Map::MAP_SHARED,
+                        device.fd.as_raw_fd(),
+                        0,
+                    ).map_err(Error::map)?
+                },
+                Upstream => {
+                    unsafe fn maybe_unmap(addr: *mut std::ffi::c_void, len: usize) {
+                        if len == 0 {
+                            return;
+                        }
+                        if let Err(e) = munmap(addr, len) {
+                            eprintln!("SGX enclave create: munmap failed: {:?}", e);
+                        }
+                    }
+
+                    // re-open device by cloning, if necessary
+                    Arc::make_mut(&mut device);
+
+                    let ptr = mmap(
+                        ptr::null_mut(),
+                        esize * 2,
+                        Prot::PROT_NONE,
+                        Map::MAP_SHARED,
+                        device.fd.as_raw_fd(),
+                        0,
+                    ).map_err(Error::map)?;
+
+                    let align_offset = ptr.align_offset(esize);
+                    if align_offset > esize {
+                        unreachable!()
+                    }
+                    let newptr = ptr.add(align_offset);
+                    maybe_unmap(ptr, align_offset);
+                    maybe_unmap(newptr.add(esize), esize - align_offset);
+
+                    newptr
+                },
+            }
         };
-        if ptr.is_null() || ptr == libc::MAP_FAILED {
-            return Err(Error::Map(IoError::last_os_error()));
-        }
+
         let mapping = Mapping {
             device,
             base: ptr as u64,
@@ -132,13 +177,54 @@ impl EnclaveLoad for InnerDevice {
             flags: eadd.secinfo.flags,
             ..Default::default()
         };
-        let adddata = ioctl::AddData {
-            dstpage: mapping.base + eadd.offset,
-            srcpage: &data,
-            secinfo: &secinfo,
-            chunks: chunks.0,
-        };
-        ioctl_unsafe!(Add, ioctl::add(mapping.device.fd.as_raw_fd(), &adddata))
+        let dstpage = mapping.base + eadd.offset;
+        match mapping.device.driver {
+            External => {
+                let adddata = ioctl::external::AddData {
+                    dstpage,
+                    srcpage: &data,
+                    secinfo: &secinfo,
+                    chunks: chunks.0,
+                };
+                ioctl_unsafe!(Add, ioctl::external::add(mapping.device.fd.as_raw_fd(), &adddata))
+            },
+            Upstream => {
+                let data = ioctl::upstream::Align4096(data);
+                let adddata = ioctl::upstream::AddData {
+                    dstpage,
+                    srcpage: &data,
+                    secinfo: &secinfo,
+                    chunks: chunks.0,
+                    reserved: [0; 6],
+                };
+                ioctl_unsafe!(Add, ioctl::upstream::add(mapping.device.fd.as_raw_fd(), &adddata))?;
+
+                let prot = match PageType::try_from(secinfo.flags.page_type()) {
+                    Ok(PageType::Reg) => {
+                        let mut prot = Prot::empty();
+                        if secinfo.flags.intersects(SecinfoFlags::R) {
+                            prot |= Prot::PROT_READ
+                        }
+                        if secinfo.flags.intersects(SecinfoFlags::W) {
+                            prot |= Prot::PROT_WRITE
+                        }
+                        if secinfo.flags.intersects(SecinfoFlags::X) {
+                            prot |= Prot::PROT_EXEC
+                        }
+                        prot
+                    }
+                    Ok(PageType::Tcs) => {
+                        Prot::PROT_READ | Prot::PROT_WRITE
+                    },
+                    _ => unreachable!(),
+                };
+                unsafe {
+                    mprotect(dstpage as _, 4096, prot).map_err(Error::map)?;
+                }
+
+                Ok(())
+            }
+        }
     }
 
     fn init(
@@ -158,11 +244,21 @@ impl EnclaveLoad for InnerDevice {
         }
 
         fn ioctl_init(mapping: &Mapping<InnerDevice>, sigstruct: &Sigstruct) -> Result<(), Error> {
-            let initdata = ioctl::InitData {
-                base: mapping.base,
-                sigstruct,
-            };
-            ioctl_unsafe!(Init, ioctl::init(mapping.device.fd.as_raw_fd(), &initdata))
+            match mapping.device.driver {
+                External => {
+                    let initdata = ioctl::external::InitData {
+                        base: mapping.base,
+                        sigstruct,
+                    };
+                    ioctl_unsafe!(Init, ioctl::external::init(mapping.device.fd.as_raw_fd(), &initdata))
+                },
+                Upstream => {
+                    let initdata = ioctl::upstream::InitData {
+                        sigstruct,
+                    };
+                    ioctl_unsafe!(Init, ioctl::upstream::init(mapping.device.fd.as_raw_fd(), &initdata))
+                }
+            }
         }
 
         fn ioctl_init_with_token(
@@ -170,15 +266,22 @@ impl EnclaveLoad for InnerDevice {
             sigstruct: &Sigstruct,
             einittoken: &Einittoken,
         ) -> Result<(), Error> {
-            let initdata = ioctl::InitDataWithToken {
-                base: mapping.base,
-                sigstruct,
-                einittoken,
-            };
-            ioctl_unsafe!(
-                Init,
-                ioctl::init_with_token(mapping.device.fd.as_raw_fd(), &initdata)
-            )
+            match mapping.device.driver {
+                External => {
+                    let initdata = ioctl::external::InitDataWithToken {
+                        base: mapping.base,
+                        sigstruct,
+                        einittoken,
+                    };
+                    ioctl_unsafe!(
+                        Init,
+                        ioctl::external::init_with_token(mapping.device.fd.as_raw_fd(), &initdata)
+                    )
+                },
+                Upstream => {
+                    Err(Error::Init(SgxIoctlError::Io(IoError::from_raw_os_error(libc::ENOTTY))))
+                }
+            }
         }
 
         // Try either EINIT ioctl(), in the order that makes most sense given
@@ -207,10 +310,27 @@ impl EnclaveLoad for InnerDevice {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DriverVersion {
+    External,
+    Upstream,
+}
+
 #[derive(Debug)]
 struct InnerDevice {
     fd: File,
-    path: PathBuf,
+    path: Arc<PathBuf>,
+    driver: DriverVersion,
+}
+
+impl Clone for InnerDevice {
+    fn clone(&self) -> Self {
+        InnerDevice {
+            fd: OpenOptions::new().read(true).write(true).open(&**self.path).unwrap(),
+            path: self.path.clone(),
+            driver: self.driver,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -225,16 +345,23 @@ pub struct DeviceBuilder {
 impl Device {
     /// Open `/dev/isgx`, or if that doesn't exist, `/dev/sgx`.
     pub fn new() -> IoResult<DeviceBuilder> {
-        const DEFAULT_DEVICE_PATH1: &'static str = "/dev/isgx";
-        const DEFAULT_DEVICE_PATH2: &'static str = "/dev/sgx";
+        const DEFAULT_DEVICE_PATHS: &[(&str, DriverVersion)] = &[
+            ("/dev/sgx/enclave", Upstream),
+            ("/dev/isgx", External),
+            ("/dev/sgx", External),
+        ];
 
-        match Self::open(DEFAULT_DEVICE_PATH1) {
-            Err(ref e) if e.kind() == io::ErrorKind::NotFound => Self::open(DEFAULT_DEVICE_PATH2),
-            v => v,
+        for &(path, version) in DEFAULT_DEVICE_PATHS {
+            match Self::open(path, version) {
+                Err(ref e) if e.kind() == io::ErrorKind::NotFound => continue,
+                result => return result,
+            }
         }
+
+        Err(IoError::new(io::ErrorKind::NotFound, "None of the default SGX device paths were found"))
     }
 
-    pub fn open<T: AsRef<Path>>(path: T) -> IoResult<DeviceBuilder> {
+    pub fn open<T: AsRef<Path>>(path: T, driver: DriverVersion) -> IoResult<DeviceBuilder> {
         let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         Ok(DeviceBuilder {
@@ -242,7 +369,8 @@ impl Device {
                 device: generic::Device {
                     inner: Arc::new(InnerDevice {
                         fd: file,
-                        path: path.to_owned(),
+                        path: Arc::new(path.to_owned()),
+                        driver,
                     }),
                     einittoken_provider: None,
                 },

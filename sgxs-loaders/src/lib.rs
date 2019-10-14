@@ -9,7 +9,7 @@
        html_root_url = "https://edp.fortanix.com/docs/api/")]
 
 #[cfg(unix)] #[macro_use]
-extern crate nix as ioctl_crate;
+extern crate nix;
 extern crate failure;
 #[cfg(unix)]
 extern crate libc;
