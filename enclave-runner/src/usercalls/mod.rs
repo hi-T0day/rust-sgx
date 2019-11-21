@@ -1582,16 +1582,15 @@ impl<'tcs> IOHandlerInput<'tcs> {
         usercall_queue: &mut FifoDescriptor<Usercall>,
         return_queue: &mut FifoDescriptor<Return>,
     ) -> IoResult<()> {
-        if self.enclave.async_queue_delivery.load(Ordering::SeqCst) {
-            // !!! calling the function a second time.
+        if self.enclave.async_queue_delivery.swap(true, Ordering::SeqCst) {
+            // calling the function a second time.
             // Should be "equivalent to calling exit(true)"
-//            self.enclave.abort_all_threads();
-//            return EnclaveAbort::Exit { true }
             return Err(IoErrorKind::Other.into());
         }
 
         *usercall_queue = self.enclave.async_queue_usercall.inner;
         *return_queue = self.enclave.async_queue_return.inner;
+
         Ok(())
     }
 }
