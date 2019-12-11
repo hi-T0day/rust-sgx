@@ -52,6 +52,7 @@ use crate::loader::{EnclavePanic, ErasedTcs};
 use crate::tcs;
 use crate::tcs::{CoResult, ThreadResult};
 use std::thread::JoinHandle;
+use tokio::prelude::task::AtomicTask;
 
 const EV_ABORT: u64 = 0b0000_0000_0000_1000;
 
@@ -567,7 +568,7 @@ enum CoEntry {
 }
 
 impl Work {
-    fn do_work(self, io_send_queue: &mut tokio::sync::mpsc::UnboundedSender<UsercallSendData>) {
+    fn do_work(self, io_send_queue: &mut tokio::sync::mpsc::UnboundedSender<UsercallSendData>, reader_waker: Arc<AtomicTask>, writer_waker: Arc<AtomicTask>) {
         let buf = RefCell::new([0u8; 1024]);
         let usercall_send_data = match self.entry {
             CoEntry::Initial(erased_tcs, p1, p2, p3, p4, p5) => {
@@ -579,6 +580,8 @@ impl Work {
                 ((UsercallType::Sync(coresult, self.tcs), buf))
             }
         };
+        reader_waker.notify();
+        writer_waker.notify();
         // if there is an error do nothing, as it means that the main thread has exited
         let _ = io_send_queue.try_send(usercall_send_data);
     }
@@ -657,6 +660,8 @@ impl EnclaveState {
     ) -> StdResult<(u64, u64), EnclaveAbort<EnclavePanic>> {
         let (tx_return_channel, mut rx_return_channel) = tokio::sync::mpsc::unbounded_channel();
         let enclave_clone = enclave.clone();
+        // The return future takes the return value of a usercall and then panics or continues based
+        // on the return value and mode of operation
         let return_future = async move {
             while let Ok((Some(work), stream)) = rx_return_channel.into_future().compat().await {
                 rx_return_channel = stream;
@@ -700,6 +705,8 @@ impl EnclaveState {
             unreachable!();
         };
         let enclave_clone = enclave.clone();
+        // The io_future is responisble for processing the usercalls and sending the results back to the
+        // respective threads or sending the error return values to the return_future
         let io_future = async move {
             let mut recv_queue = io_queue_receive.into_future();
             while let Ok((Some(work), stream)) = recv_queue.compat().await {
@@ -821,8 +828,6 @@ impl EnclaveState {
                                 }
                                 Err(EnclaveAbort::Exit { panic: true }) => {
                                     println!("Cannot Attach debugger to async function call");
-//                                    #[cfg(unix)]
-//                                        trap_attached_debugger(usercall.tcs_address() as _).await;
                                     Err(EnclaveAbort::Exit {
                                         panic: EnclavePanic::from(buf.into_inner()),
                                     })
@@ -874,23 +879,23 @@ impl EnclaveState {
             async_ret_rx: crossbeam::crossbeam_channel::Receiver<(Return, usize)>
         ) -> Vec<JoinHandle<()>> {
             let mut thread_handles = vec![];
-            let writer_waker = Arc::new(tokio::prelude::task::AtomicTask::new());
-            let reader_waker = Arc::new(tokio::prelude::task::AtomicTask::new());
+            let writer_waker = Arc::new(AtomicTask::new());
+            let reader_waker = Arc::new(AtomicTask::new());
 
             //loop through async_queue
             let enclave_clone = enclave.clone();
             let mut io_queue_send_clone = io_queue_send.clone();
             let reader_waker_clone = reader_waker.clone();
-            let writer_waker_clone = writer_waker.clone();
             thread::spawn(move || {
 
-                tokio::runtime::current_thread::block_on_all(tokio::prelude::future::poll_fn(|| -> Poll<(),()> {
+                let _ = tokio::runtime::current_thread::block_on_all(tokio::prelude::future::poll_fn(|| -> Poll<(),()> {
                     loop {
                         let val = unsafe {enclave_clone.async_queue_usercall.recv()};
                         match val {
                             None => {
                                 // sleep
                                 // retry after waking up
+                                // NOTE: this is woken up everytime a synchronous usercall is
                                 reader_waker_clone.register();
                                 return Ok(Async::NotReady);
                             },
@@ -902,8 +907,7 @@ impl EnclaveState {
                                     break;
                                 }
                                 if wakeup_writer {
-                                    // notify writer
-                                    writer_waker_clone.notify();
+                                    // !!! notify writer in enclave
                                 }
                             }
                         }
@@ -913,10 +917,12 @@ impl EnclaveState {
             });
 
             let enclave_clone = enclave.clone();
+            let writer_waker_clone = writer_waker.clone();
+
             thread::spawn(move || {
                 // save data here if unsent;
                 let mut unsent_data : Option<(Return, usize)> = None;
-                tokio::runtime::current_thread::block_on_all(
+                let _ = tokio::runtime::current_thread::block_on_all(
                     tokio::prelude::future::poll_fn( || -> Poll<(),()> {
                         loop {
                             let val = match unsent_data {
@@ -938,12 +944,11 @@ impl EnclaveState {
                                             // sleep
                                             // retry after waking up
                                             unsent_data = Some((ret,id));
-                                            writer_waker.register();
+                                            writer_waker_clone.register();
                                             return Ok(Async::NotReady);
                                         }
                                         Some(true) => {
-                                            // notify reader
-                                            reader_waker.notify();
+                                            // !!! notify reader in enclave
                                         }
                                         Some(false) => {
                                             // do nothing
@@ -960,10 +965,12 @@ impl EnclaveState {
             for _ in 0..num_of_worker_threads {
                 let work_receiver = work_receiver.clone();
                 let mut io_queue_send = io_queue_send.clone();
+                let reader_waker_clone = reader_waker.clone();
+                let writer_waker_clone = writer_waker.clone();
 
                 thread_handles.push(thread::spawn(move || {
                     while let Ok(work) = work_receiver.recv() {
-                        work.do_work(&mut io_queue_send);
+                        work.do_work(&mut io_queue_send, reader_waker_clone.clone(), writer_waker_clone.clone());
                     }
                 }));
             }

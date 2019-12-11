@@ -706,7 +706,7 @@ pub mod async {
         pub data: *const Slot<T>,
         /// The number of elements pointed to by `data`. Must be a power of two
         /// less than or equal to 2³¹.
-        pub capacity: u32,
+        pub capacity: usize,
         /// Actually a `(u32, u32)` tuple, aligned to allow atomic operations
         /// on both halves simultaneously. The first element (low dword) is
         /// the read offset and the second element (high dword) is the write

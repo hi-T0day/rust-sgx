@@ -1,7 +1,6 @@
 extern crate fortanix_sgx_abi;
 
 use std::{iter, mem, ptr, slice};
-use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use fortanix_sgx_abi::{FifoDescriptor, Slot};
@@ -43,12 +42,13 @@ struct Queue<T>(FifoDescriptorContainer<T>);
 
 impl<T> Queue<T> {
     pub fn new(capacity: usize) -> Self {
+        assert!(capacity <= usize::pow(2, 31));
         let offsets: Box<AtomicUsize> = Box::new(AtomicUsize::new(0));
         let data: Box<[Slot<T>]> = iter::repeat_with(|| unsafe { mem::zeroed() }).take(capacity).collect::<Vec<_>>()
             .into_boxed_slice();
         assert_eq!(data.len(), capacity);
         let data = Box::into_raw(data) as *mut Slot<T>;
-        let descriptor = FifoDescriptor { data, capacity: capacity as u32, offsets: Box::into_raw(offsets) };
+        let descriptor = FifoDescriptor { data, capacity, offsets: Box::into_raw(offsets) };
 
         Queue(FifoDescriptorContainer{inner: descriptor})
     }
@@ -87,37 +87,14 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Reciever<T>) {
 ///
 /// The following procedures will operate the queues in a multiple producer
 /// single consumer (MPSC) fashion.
-#[repr(C)]
-pub struct FifoDescriptor<T> {
-    /// Pointer to the queue memory. Must have a size of
-    /// `capacity * size_of::<Slot<T>>()` bytes and have alignment `align_of::<Slot<T>>()`.
-    pub data: *const Slot<T>,
-    /// The number of elements pointed to by `data`. Must be a power of two
-    /// less than or equal to 2³⁰.
-    pub capacity: u32,
-    /// Actually a `(u32, u32)` tuple, aligned to allow atomic operations
-    /// on both halves simultaneously. The first element (low dword) is
-    /// the read offset and the second element (high dword) is the write
-    /// offset.
-    pub offsets: *const AtomicUsize,
-}
-
-unsafe impl<T: Send> Send for FifoDescriptor<T> {}
-unsafe impl<T: Send> Sync for FifoDescriptor<T> {}
-
-#[repr(C)]
-pub struct Slot<T> {
-    /// `0` indicates this slot is empty.
-    id: AtomicUsize,
-    data: UnsafeCell<T>,
-}*/
+*/
 
 pub struct FifoDescriptorContainer<T> {
     pub inner: FifoDescriptor<T>,
 }
 
-unsafe impl <T:Copy> Sync for FifoDescriptorContainer<T> {}
-unsafe impl <T:Copy> Send for FifoDescriptorContainer<T> {}
+unsafe impl <T:Send> Sync for FifoDescriptorContainer<T> {}
+unsafe impl <T:Send> Send for FifoDescriptorContainer<T> {}
 
 #[derive(Debug)]
 struct Offsets {
@@ -171,6 +148,7 @@ impl Offsets {
 
 impl<T: Copy> FifoDescriptorContainer<T> {
     pub fn new(capacity: usize) -> Self {
+        assert!(capacity <= usize::pow(2, 31));
         let offsets: Box<AtomicUsize> = Box::new(AtomicUsize::new(0));
         let data: Box<[Slot<T>]> = iter::repeat_with(|| unsafe { mem::zeroed() }).take(capacity).collect::<Vec<_>>()
             .into_boxed_slice();
@@ -181,8 +159,9 @@ impl<T: Copy> FifoDescriptorContainer<T> {
     }
 
     pub fn from_raw(data: *mut Slot<T>, capacity: usize, offsets: *mut AtomicUsize) -> Self {
+        assert!(capacity <= usize::pow(2, 31));
         FifoDescriptorContainer {
-            inner: FifoDescriptor { data, capacity: capacity as u32, offsets }
+            inner: FifoDescriptor { data, capacity, offsets }
         }
     }
 
@@ -191,7 +170,7 @@ impl<T: Copy> FifoDescriptorContainer<T> {
     }
 
     pub unsafe fn len(&self) -> usize {
-        Offsets::from_usize((*self.inner.offsets).load(Ordering::Relaxed)).len(self.inner.capacity)
+        Offsets::from_usize((*self.inner.offsets).load(Ordering::Relaxed)).len(self.inner.capacity as u32)
     }
 
     pub unsafe fn send(&self, id: usize, data: T) -> Option<bool /* wakeup reader? */> {
@@ -202,19 +181,19 @@ impl<T: Copy> FifoDescriptorContainer<T> {
             offsets = Offsets::from_usize(old_offsets);
 
             // 2. If the queue is full, wait, then go to step 1.
-            if offsets.is_full(self.inner.capacity) {
+            if offsets.is_full(self.inner.capacity as u32) {
                 return None
             }
 
             // 3. Add 1 to the write offset and do an atomic compare-and-swap (CAS)
             //    with the current offsets. If the CAS was not succesful, go to step 1.
-            offsets.increment_write_offset(self.inner.capacity);
+            offsets.increment_write_offset(self.inner.capacity as u32);
             if (*self.inner.offsets).compare_and_swap(old_offsets, offsets.as_usize(), Ordering::Acquire) == old_offsets {
                 break
             }
         }
 
-        let offset = offsets.write_offset(self.inner.capacity);
+        let offset = offsets.write_offset(self.inner.capacity as u32);
         assert!(offset < self.inner.capacity as isize);
         let slot = &*self.inner.data.offset(offset);
         // 4. Write the data, then the `id`.
@@ -244,13 +223,13 @@ impl<T: Copy> FifoDescriptorContainer<T> {
         }
 
         // 3. Add 1 to the read offset.
-        offsets.increment_read_offset(self.inner.capacity);
+        offsets.increment_read_offset(self.inner.capacity as u32);
 
         // 4. Read the `id` at the new read offset.
         // 5. If `id` is `0`, go to step 4 (spin). Spinning is OK because data is
         //    expected to be written imminently.
         // 6. Store `0` in the `id` and read the data.
-        let offset = offsets.read_offset(self.inner.capacity);
+        let offset = offsets.read_offset(self.inner.capacity as u32);
         assert!(offset < self.inner.capacity as isize);
         let slot = &*self.inner.data.offset(offset);
         let id = iter::repeat_with(|| slot.id.load(Ordering::Acquire)).find(|&id| id != 0).unwrap();
@@ -265,6 +244,6 @@ impl<T: Copy> FifoDescriptorContainer<T> {
         }
 
         // 8. If the queue was full in step 1, signal the writer to wake up.
-        Some((id, data, Offsets::from_usize(old_offsets).is_full(self.inner.capacity)))
+        Some((id, data, Offsets::from_usize(old_offsets).is_full(self.inner.capacity as u32)))
     }
 }
